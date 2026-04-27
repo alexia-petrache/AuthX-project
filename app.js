@@ -1,8 +1,10 @@
-const express    = require('express');
-const { Pool }   = require('pg');
-const bodyParser = require('body-parser');
-const cookieParser = require('cookie-parser');
-const path       = require('path');
+const express      = require('express');
+const { Pool }     = require('pg');
+const bcrypt       = require('bcrypt');
+const session      = require('express-session');
+const rateLimit    = require('express-rate-limit');
+const crypto       = require('crypto');
+const path         = require('path');
 
 const app = express();
 
@@ -14,11 +16,67 @@ const pool = new Pool({
     port:     5432,
 });
 
+// -------------------------------------------------------
+// MIDDLEWARE
+// -------------------------------------------------------
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(cookieParser());
+
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'authx-v2-secret-schimba-in-productie',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: false,
+        sameSite: 'strict',
+        maxAge: 30 * 60 * 1000
+    }
+}));
+
+app.use((req, res, next) => {
+    res.setHeader('Content-Security-Policy',
+        "default-src 'self'; " +
+        "script-src 'self' https://cdn.jsdelivr.net; " +
+        "style-src 'self' https://cdn.jsdelivr.net; " +
+        "font-src 'self' https://cdn.jsdelivr.net; " +
+        "img-src 'self' data:;"
+    );
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Rate limiter: max 10 cereri la /login per IP per 15 minute
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    message: 'Prea multe încercări. Încearcă din nou după 15 minute.',
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// -------------------------------------------------------
+// AUTH MIDDLEWARE
+// -------------------------------------------------------
+function requireAuth(req, res, next) {
+    if (!req.session.userId) return res.redirect('/login');
+    next();
+}
+
+function requireRole(role) {
+    return (req, res, next) => {
+        if (req.session.role !== role) {
+            return res.status(403).send(page('Acces Interzis',
+                '<div class="alert alert-danger">403 Forbidden — Rol insuficient.</div>' +
+                '<a href="/dashboard" class="btn btn-secondary">← Dashboard</a>'
+            ));
+        }
+        next();
+    };
+}
 
 // -------------------------------------------------------
 // AUDIT HELPER
@@ -32,6 +90,25 @@ async function logAction(userId, action, resource, resourceId, req) {
     } catch (err) {
         console.error('[Audit Error]', err.message);
     }
+}
+
+// -------------------------------------------------------
+// VALIDARE PAROLA
+// -------------------------------------------------------
+function validatePassword(password) {
+    if (!password || password.length < 8) {
+        return 'Parola trebuie să aibă cel puțin 8 caractere.';
+    }
+    if (!/[A-Z]/.test(password)) {
+        return 'Parola trebuie să conțină cel puțin o literă mare.';
+    }
+    if (!/[0-9]/.test(password)) {
+        return 'Parola trebuie să conțină cel puțin o cifră.';
+    }
+    if (!/[!@#$%^&*()_+\-=\[\]{}]/.test(password)) {
+        return 'Parola trebuie să conțină cel puțin un caracter special (!@#$%^&*).';
+    }
+    return null;
 }
 
 // -------------------------------------------------------
@@ -49,34 +126,61 @@ app.post('/register', async (req, res) => {
     const { username, password, role } = req.body;
 
     if (!username || !password) {
-        return res.status(400).send(page('Eroare', '<div class="alert alert-danger">Username și parola sunt obligatorii.</div><a href="/register">← Înapoi</a>'));
+        return res.status(400).send(page('Eroare',
+            '<div class="alert alert-danger">Email și parola sunt obligatorii.</div>' +
+            '<a href="/register">← Înapoi</a>'
+        ));
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(username)) {
+        return res.status(400).send(page('Eroare',
+            '<div class="alert alert-danger">Format email invalid.</div>' +
+            '<a href="/register">← Înapoi</a>'
+        ));
+    }
+
+    const pwError = validatePassword(password);
+    if (pwError) {
+        return res.status(400).send(page('Eroare',
+            `<div class="alert alert-danger">${escHtml(pwError)}</div>` +
+            '<a href="/register">← Înapoi</a>'
+        ));
     }
 
     try {
+        const passwordHash = await bcrypt.hash(password, 12);
+        const allowedRole = (role === 'MANAGER') ? 'MANAGER' : 'ANALYST';
+
         const result = await pool.query(
             'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
-            [username, password, role || 'ANALYST']
+            [username, passwordHash, allowedRole]
         );
         await logAction(result.rows[0].id, 'REGISTER', 'auth', null, req);
 
-        res.send(page('Cont Creat', `
-            <div class="alert alert-success">✓ Cont creat cu succes!</div>
-            <a href="/login" class="btn btn-primary">→ Mergi la Login</a>
-        `));
+        res.send(page('Cont Creat',
+            '<div class="alert alert-success">✓ Cont creat cu succes!</div>' +
+            '<a href="/login" class="btn btn-primary">→ Mergi la Login</a>'
+        ));
     } catch (err) {
         if (err.code === '23505') {
-            res.status(400).send(page('Eroare', '<div class="alert alert-danger">Utilizatorul există deja.</div><a href="/register">← Încearcă din nou</a>'));
-        } else {
-            res.status(500).send(page('Eroare Server', `<pre class="bg-light p-3">${err.stack}</pre>`));
+            return res.status(400).send(page('Eroare',
+                '<div class="alert alert-danger">Utilizatorul există deja.</div>' +
+                '<a href="/register">← Încearcă din nou</a>'
+            ));
         }
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
 // -------------------------------------------------------
 // 2. LOGIN
 // -------------------------------------------------------
-app.post('/login', async (req, res) => {
+app.post('/login', loginLimiter, async (req, res) => {
     const { username, password } = req.body;
+    const genericError = page('Login Eșuat',
+        '<div class="alert alert-danger">Credențiale incorecte.</div>' +
+        '<a href="/login" class="btn btn-secondary">← Înapoi</a>'
+    );
 
     try {
         const result = await pool.query(
@@ -84,36 +188,55 @@ app.post('/login', async (req, res) => {
         );
 
         if (result.rows.length === 0) {
-            await logAction(null, 'LOGIN_FAIL_NO_USER', 'auth', null, req);
-            return res.status(401).send(page('Login Eșuat', `
-                <div class="alert alert-warning">
-                    Utilizatorul <strong>${escHtml(username)}</strong> nu există în sistem.
-                </div>
-                <a href="/login" class="btn btn-secondary">← Înapoi</a>
-            `));
+            await bcrypt.compare(password, '$2b$12$invalidhashfortimingattackprevention00000000000000000000');
+            await logAction(null, 'LOGIN_FAIL', 'auth', null, req);
+            return res.status(401).send(genericError);
         }
 
         const user = result.rows[0];
 
-        if (user.password_hash !== password) {
-            await logAction(user.id, 'LOGIN_FAIL_WRONG_PASS', 'auth', null, req);
-            return res.status(401).send(page('Login Eșuat', `
-                <div class="alert alert-danger">
-                    Parolă greșită pentru utilizatorul <strong>${escHtml(username)}</strong>.
-                </div>
-                <a href="/login" class="btn btn-secondary">← Înapoi</a>
-            `));
+        if (user.locked_until && new Date() < new Date(user.locked_until)) {
+            return res.status(401).send(page('Cont Blocat',
+                '<div class="alert alert-danger">Contul este temporar blocat. Încearcă din nou mai târziu.</div>' +
+                '<a href="/login" class="btn btn-secondary">← Înapoi</a>'
+            ));
         }
 
-        res.cookie('user_id',  String(user.id));
-        res.cookie('role',     user.role);
-        res.cookie('username', user.email);
+        const passwordMatch = await bcrypt.compare(password, user.password_hash);
 
-        await logAction(user.id, 'LOGIN', 'auth', null, req);
-        res.redirect('/dashboard');
+        if (!passwordMatch) {
+            const newAttempts = (user.login_attempts || 0) + 1;
+            if (newAttempts >= 5) {
+                await pool.query(
+                    "UPDATE users SET login_attempts = $1, locked_until = NOW() + INTERVAL '15 minutes' WHERE id = $2",
+                    [newAttempts, user.id]
+                );
+            } else {
+                await pool.query(
+                    'UPDATE users SET login_attempts = $1 WHERE id = $2',
+                    [newAttempts, user.id]
+                );
+            }
+            await logAction(user.id, 'LOGIN_FAIL', 'auth', null, req);
+            return res.status(401).send(genericError);
+        }
+
+        await pool.query(
+            'UPDATE users SET login_attempts = 0, locked_until = NULL WHERE id = $1',
+            [user.id]
+        );
+
+        req.session.regenerate((err) => {
+            if (err) return res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
+            req.session.userId = user.id;
+            req.session.role   = user.role;
+            req.session.email  = user.email;
+            logAction(user.id, 'LOGIN', 'auth', null, req);
+            res.redirect('/dashboard');
+        });
 
     } catch (err) {
-        res.status(500).send(page('Eroare', `<pre>${err.message}</pre>`));
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
@@ -121,28 +244,34 @@ app.post('/login', async (req, res) => {
 // 3. LOGOUT
 // -------------------------------------------------------
 app.get('/logout', async (req, res) => {
-    const userId = req.cookies.user_id;
+    const userId = req.session.userId;
     if (userId) await logAction(userId, 'LOGOUT', 'auth', null, req);
-    res.clearCookie('user_id');
-    res.clearCookie('role');
-    res.clearCookie('username');
-    res.redirect('/login');
+    req.session.destroy(() => {
+        res.clearCookie('connect.sid');
+        res.redirect('/login');
+    });
 });
 
 // -------------------------------------------------------
 // 4. DASHBOARD
 // -------------------------------------------------------
-app.get('/dashboard', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
+app.get('/dashboard', requireAuth, async (req, res) => {
+    const userId = req.session.userId;
+    const role   = req.session.role;
+    const email  = req.session.email;
 
     try {
-        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
-        const user = userRes.rows[0] || { email: req.cookies.username || '?', role: req.cookies.role || '?', id: userId };
-
-        const ticketsRes = await pool.query(
-            'SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id ORDER BY t.created_at DESC'
-        );
+        let ticketsRes;
+        if (role === 'MANAGER') {
+            ticketsRes = await pool.query(
+                'SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id ORDER BY t.created_at DESC'
+            );
+        } else {
+            ticketsRes = await pool.query(
+                'SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id WHERE t.owner_id = $1 ORDER BY t.created_at DESC',
+                [userId]
+            );
+        }
 
         const ticketRows = ticketsRes.rows.map(t => `
             <tr>
@@ -153,7 +282,7 @@ app.get('/dashboard', async (req, res) => {
                 <td><small>${escHtml(t.owner_email || 'N/A')}</small></td>
                 <td>
                     <a href="/ticket/${t.id}" class="btn btn-sm btn-primary py-0">Vezi</a>
-                    <a href="/ticket/${t.id}/delete" class="btn btn-sm btn-danger py-0" onclick="return confirm('Șterge?')">Del</a>
+                    <a href="/ticket/${t.id}/delete" class="btn btn-sm btn-danger py-0 btn-delete">Șterge</a>
                 </td>
             </tr>`).join('') || '<tr><td colspan="6" class="text-center text-muted">Niciun ticket. Adaugă primul!</td></tr>';
 
@@ -168,8 +297,8 @@ app.get('/dashboard', async (req, res) => {
 <nav class="navbar navbar-dark bg-dark px-4">
     <span class="navbar-brand fw-bold">🔐 AuthX Internal Portal</span>
     <div class="d-flex align-items-center text-white gap-3">
-        <span>Salut, <strong>${escHtml(user.email)}</strong> | Rol: <strong>${escHtml(user.role)}</strong></span>
-        ${user.role === 'MANAGER' ? '<a href="/audit" class="btn btn-outline-warning btn-sm">📋 Audit Logs</a>' : ''}
+        <span>Salut, <strong>${escHtml(email)}</strong> | Rol: <strong>${escHtml(role)}</strong></span>
+        ${role === 'MANAGER' ? '<a href="/audit" class="btn btn-outline-warning btn-sm">📋 Audit Logs</a>' : ''}
         <a href="/logout" class="btn btn-outline-danger btn-sm">Logout</a>
     </div>
 </nav>
@@ -227,28 +356,42 @@ app.get('/dashboard', async (req, res) => {
     </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="/dashboard-v2.js"></script>
 </body>
 </html>`);
     } catch (err) {
-        res.status(500).send(page('Eroare', `<pre>${err.message}</pre>`));
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
 // -------------------------------------------------------
 // 5. TICKET VIEW
 // -------------------------------------------------------
-app.get('/ticket/:id', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
+app.get('/ticket/:id', requireAuth, async (req, res) => {
+    const userId = req.session.userId;
+    const role   = req.session.role;
 
     try {
         const result = await pool.query(
             'SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id WHERE t.id = $1',
             [req.params.id]
         );
-        if (result.rows.length === 0) return res.status(404).send(page('404', '<div class="alert alert-danger">Ticket negăsit.</div><a href="/dashboard">← Dashboard</a>'));
+        if (result.rows.length === 0) {
+            return res.status(404).send(page('404',
+                '<div class="alert alert-danger">Ticket negăsit.</div>' +
+                '<a href="/dashboard">← Dashboard</a>'
+            ));
+        }
 
         const t = result.rows[0];
+
+        if (role !== 'MANAGER' && t.owner_id !== userId) {
+            await logAction(userId, 'ACCESS_DENIED', 'ticket', t.id, req);
+            return res.status(403).send(page('Acces Interzis',
+                '<div class="alert alert-danger">Nu ai acces la acest ticket.</div>' +
+                '<a href="/dashboard">← Dashboard</a>'
+            ));
+        }
 
         res.send(page(`Ticket #${t.id}`, `
             <div class="card">
@@ -263,7 +406,7 @@ app.get('/ticket/:id', async (req, res) => {
                     <p class="text-muted small">Owner: ${escHtml(t.owner_email || 'N/A')} | Creat: ${new Date(t.created_at).toLocaleString('ro-RO')}</p>
                     <hr>
                     <p><strong>Descriere:</strong></p>
-                    <div class="border rounded p-3 bg-light">${t.description || '<em>fără descriere</em>'}</div>
+                    <div class="border rounded p-3 bg-light">${escHtml(t.description || '')}</div>
                 </div>
             </div>
             <form action="/ticket/${t.id}/edit" method="POST" class="mt-3 d-flex gap-2 align-items-end">
@@ -279,21 +422,35 @@ app.get('/ticket/:id', async (req, res) => {
             </form>
             <div class="mt-3 d-flex gap-2">
                 <a href="/dashboard" class="btn btn-secondary btn-sm">← Dashboard</a>
-                <a href="/ticket/${t.id}/delete" class="btn btn-danger btn-sm" onclick="return confirm('Ștergi ticket-ul #${t.id}?')">🗑 Șterge</a>
+                <a href="/ticket/${t.id}/delete" class="btn btn-danger btn-sm btn-delete-single">🗑 Șterge</a>
             </div>
+            <script src="/confirm-delete.js"></script>
         `));
     } catch (err) {
-        res.status(500).send(page('Eroare', `<pre>${err.message}</pre>`));
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
 // -------------------------------------------------------
 // 6. TICKET EDIT
 // -------------------------------------------------------
-app.post('/ticket/:id/edit', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
+app.post('/ticket/:id/edit', requireAuth, async (req, res) => {
+    const userId = req.session.userId;
+    const role   = req.session.role;
+
+    const result = await pool.query('SELECT owner_id FROM tickets WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).send(page('404', '<div class="alert alert-danger">Ticket negăsit.</div>'));
+
+    if (role !== 'MANAGER' && result.rows[0].owner_id !== userId) {
+        return res.status(403).send(page('Acces Interzis', '<div class="alert alert-danger">Nu ai acces la acest ticket.</div>'));
+    }
+
     const { status } = req.body;
+    const allowed = ['OPEN', 'IN PROGRESS', 'RESOLVED'];
+    if (!allowed.includes(status)) {
+        return res.status(400).send(page('Eroare', '<div class="alert alert-danger">Status invalid.</div>'));
+    }
+
     await pool.query('UPDATE tickets SET status = $1, updated_at = NOW() WHERE id = $2', [status, req.params.id]);
     await logAction(userId, 'UPDATE_TICKET', 'ticket', req.params.id, req);
     res.redirect(`/ticket/${req.params.id}`);
@@ -302,9 +459,17 @@ app.post('/ticket/:id/edit', async (req, res) => {
 // -------------------------------------------------------
 // 7. TICKET DELETE
 // -------------------------------------------------------
-app.get('/ticket/:id/delete', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
+app.get('/ticket/:id/delete', requireAuth, async (req, res) => {
+    const userId = req.session.userId;
+    const role   = req.session.role;
+
+    const result = await pool.query('SELECT owner_id FROM tickets WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.redirect('/dashboard');
+
+    if (role !== 'MANAGER' && result.rows[0].owner_id !== userId) {
+        return res.status(403).send(page('Acces Interzis', '<div class="alert alert-danger">Nu ai acces la acest ticket.</div>'));
+    }
+
     await pool.query('DELETE FROM tickets WHERE id = $1', [req.params.id]);
     await logAction(userId, 'DELETE_TICKET', 'ticket', req.params.id, req);
     res.redirect('/dashboard');
@@ -313,32 +478,55 @@ app.get('/ticket/:id/delete', async (req, res) => {
 // -------------------------------------------------------
 // 8. CREATE TICKET
 // -------------------------------------------------------
-app.post('/tickets', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
+app.post('/tickets', requireAuth, async (req, res) => {
+    const userId = req.session.userId;
     const { title, description, severity } = req.body;
+
+    if (!title || title.trim().length === 0) {
+        return res.status(400).send(page('Eroare', '<div class="alert alert-danger">Titlul este obligatoriu.</div>'));
+    }
+
+    const allowedSeverity = ['HIGH', 'MED', 'LOW'];
+    const safeSeverity = allowedSeverity.includes(severity) ? severity : 'LOW';
+
     const result = await pool.query(
         'INSERT INTO tickets (title, description, severity, status, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-        [title, description || '', severity || 'LOW', 'OPEN', userId]
+        [title.trim(), description || '', safeSeverity, 'OPEN', userId]
     );
     await logAction(userId, 'CREATE_TICKET', 'ticket', result.rows[0].id, req);
     res.redirect('/dashboard');
 });
 
 // -------------------------------------------------------
-// 9. SEARCH
+// 9. SEARCH — query parametrizat (fara SQL injection)
 // -------------------------------------------------------
-app.get('/search', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
-    const q = req.query.q || '';
-
-    const sqlRaw = `SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id WHERE t.title ILIKE '%${q}%' OR t.description ILIKE '%${q}%'`;
+app.get('/search', requireAuth, async (req, res) => {
+    const userId = req.session.userId;
+    const role   = req.session.role;
+    const q      = req.query.q || '';
 
     try {
-        const result = await pool.query(sqlRaw);
+        let result;
+        if (role === 'MANAGER') {
+            result = await pool.query(
+                'SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id WHERE t.title ILIKE $1 OR t.description ILIKE $1 ORDER BY t.created_at DESC',
+                [`%${q}%`]
+            );
+        } else {
+            result = await pool.query(
+                'SELECT t.*, u.email AS owner_email FROM tickets t LEFT JOIN users u ON t.owner_id = u.id WHERE (t.title ILIKE $1 OR t.description ILIKE $1) AND t.owner_id = $2 ORDER BY t.created_at DESC',
+                [`%${q}%`, userId]
+            );
+        }
+
         const rows = result.rows.map(t =>
-            `<tr><td>${t.id}</td><td>${escHtml(t.title)}</td><td>${t.severity}</td><td>${t.status}</td><td>${escHtml(t.owner_email || 'N/A')}</td></tr>`
+            `<tr>
+                <td>${t.id}</td>
+                <td><a href="/ticket/${t.id}">${escHtml(t.title)}</a></td>
+                <td>${t.severity}</td>
+                <td>${t.status}</td>
+                <td>${escHtml(t.owner_email || 'N/A')}</td>
+            </tr>`
         ).join('') || '<tr><td colspan="5" class="text-muted text-center">Niciun rezultat.</td></tr>';
 
         res.send(page('Rezultate căutare', `
@@ -350,29 +538,58 @@ app.get('/search', async (req, res) => {
             <a href="/dashboard" class="btn btn-secondary btn-sm">← Dashboard</a>
         `));
     } catch (err) {
-        res.status(500).send(page('Eroare', `<pre>${err.message}</pre>`));
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
 // -------------------------------------------------------
 // 10. FORGOT PASSWORD
 // -------------------------------------------------------
-const resetTokens = {};
+const RESET_EXPIRY_MS = 15 * 60 * 1000;
 
 app.post('/forgot-password', async (req, res) => {
     const { email } = req.body;
-    const resetToken = String(Date.now()).slice(-5);
-    resetTokens[email] = { token: resetToken, used: false };
+    const genericMsg = page('Token Trimis',
+        '<div class="alert alert-info">Dacă adresa există în sistem, vei primi un token de resetare.</div>' +
+        '<a href="/login" class="btn btn-secondary">← Login</a>'
+    );
 
-    res.send(page('Token Trimis', `
-        <div class="alert alert-info">
-            Token generat pentru <strong>${escHtml(email)}</strong>:<br>
-            <span style="font-size:2rem;font-weight:bold;letter-spacing:.3rem">${resetToken}</span>
-        </div>
-        <a href="/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}" class="btn btn-primary">
-            → Resetează parola
-        </a>
-    `));
+    try {
+        const result = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+        if (result.rows.length === 0) {
+            return res.send(genericMsg);
+        }
+
+        const userId = result.rows[0].id;
+
+        await pool.query(
+            'UPDATE reset_tokens SET used = TRUE WHERE user_id = $1 AND used = FALSE',
+            [userId]
+        );
+
+        const token     = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const expiresAt = new Date(Date.now() + RESET_EXPIRY_MS);
+
+        await pool.query(
+            'INSERT INTO reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+            [userId, tokenHash, expiresAt]
+        );
+
+        await logAction(userId, 'FORGOT_PASSWORD', 'auth', null, req);
+
+        res.send(page('Token Trimis', `
+            <div class="alert alert-info">
+                Token de resetare (valabil 15 minute):<br>
+                <small class="text-muted">În producție acesta ar fi trimis pe email.</small>
+            </div>
+            <a href="/reset-password?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}" class="btn btn-primary mt-2">
+                → Resetează parola
+            </a>
+        `));
+    } catch (err) {
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
+    }
 });
 
 // -------------------------------------------------------
@@ -389,6 +606,7 @@ app.get('/reset-password', (req, res) => {
                 <div class="mb-3">
                     <label class="form-label">Parolă nouă</label>
                     <input type="password" name="newPassword" class="form-control" required>
+                    <div class="form-text">Min. 8 caractere, o literă mare, o cifră, un caracter special.</div>
                 </div>
                 <button class="btn btn-primary w-100">Resetează</button>
             </form>
@@ -398,40 +616,58 @@ app.get('/reset-password', (req, res) => {
 
 app.post('/reset-password', async (req, res) => {
     const { token, email, newPassword } = req.body;
-    const entry = resetTokens[email];
 
-    if (entry && entry.token === token) {
-        await pool.query('UPDATE users SET password_hash = $1 WHERE email = $2', [newPassword, email]);
+    const pwError = validatePassword(newPassword);
+    if (pwError) {
+        return res.status(400).send(page('Eroare',
+            `<div class="alert alert-danger">${escHtml(pwError)}</div>` +
+            '<a href="/forgot-password">← Încearcă din nou</a>'
+        ));
+    }
 
-        res.send(page('Parolă Resetată', `
-            <div class="alert alert-success">✓ Parola a fost resetată cu succes!</div>
-            <a href="/login" class="btn btn-primary">→ Login</a>
-        `));
-    } else {
-        res.status(400).send(page('Token Invalid', `
-            <div class="alert alert-danger">Token invalid sau expirat.</div>
-            <a href="/forgot-password" class="btn btn-secondary">← Încearcă din nou</a>
-        `));
+    const tokenHash = crypto.createHash('sha256').update(token || '').digest('hex');
+
+    try {
+        const result = await pool.query(
+            `SELECT rt.id, rt.user_id FROM reset_tokens rt
+             JOIN users u ON rt.user_id = u.id
+             WHERE u.email = $1
+               AND rt.token_hash = $2
+               AND rt.used = FALSE
+               AND rt.expires_at > NOW()`,
+            [email, tokenHash]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(400).send(page('Token Invalid',
+                '<div class="alert alert-danger">Token invalid sau expirat.</div>' +
+                '<a href="/forgot-password" class="btn btn-secondary">← Încearcă din nou</a>'
+            ));
+        }
+
+        const { id: tokenId, user_id: userId } = result.rows[0];
+        const hash = await bcrypt.hash(newPassword, 12);
+
+        await pool.query(
+            'UPDATE users SET password_hash = $1, login_attempts = 0, locked_until = NULL WHERE id = $2',
+            [hash, userId]
+        );
+        await pool.query('UPDATE reset_tokens SET used = TRUE WHERE id = $1', [tokenId]);
+        await logAction(userId, 'RESET_PASSWORD', 'auth', null, req);
+
+        res.send(page('Parolă Resetată',
+            '<div class="alert alert-success">✓ Parola a fost resetată cu succes!</div>' +
+            '<a href="/login" class="btn btn-primary">→ Login</a>'
+        ));
+    } catch (err) {
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
 // -------------------------------------------------------
 // 12. AUDIT LOGS
 // -------------------------------------------------------
-app.get('/audit', async (req, res) => {
-    const userId = req.cookies.user_id;
-    if (!userId) return res.redirect('/login');
-
-    const role = req.cookies.role;
-    if (role !== 'MANAGER') {
-        return res.status(403).send(page('Acces Interzis', `
-            <div class="alert alert-danger">
-                403 Forbidden — Rol insuficient: <code>${escHtml(role)}</code>
-            </div>
-            <a href="/dashboard" class="btn btn-secondary">← Dashboard</a>
-        `));
-    }
-
+app.get('/audit', requireAuth, requireRole('MANAGER'), async (req, res) => {
     try {
         const logs = await pool.query(
             'SELECT al.*, u.email FROM audit_logs al LEFT JOIN users u ON al.user_id = u.id ORDER BY al.timestamp DESC LIMIT 100'
@@ -458,7 +694,7 @@ app.get('/audit', async (req, res) => {
             <a href="/dashboard" class="btn btn-secondary btn-sm">← Dashboard</a>
         `));
     } catch (err) {
-        res.status(500).send(page('Eroare', `<pre>${err.message}</pre>`));
+        res.status(500).send(page('Eroare', '<div class="alert alert-danger">Eroare internă.</div>'));
     }
 });
 
@@ -470,7 +706,8 @@ function escHtml(str) {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function page(title, body) {
@@ -503,5 +740,5 @@ function page(title, body) {
 // -------------------------------------------------------
 const PORT = 3000;
 app.listen(PORT, () => {
-    console.log(`AuthX - http://localhost:${PORT}`);
+    console.log(`AuthX v2 (securizata) - http://localhost:${PORT}`);
 });

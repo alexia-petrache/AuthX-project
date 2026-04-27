@@ -10,9 +10,12 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "bcrypt": "^6.0.0",
     "body-parser": "^2.2.2",
     "cookie-parser": "^1.4.7",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.4.1",
+    "express-session": "^1.19.0",
     "pg": "^8.20.0"
   }
 }
