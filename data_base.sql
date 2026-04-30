@@ -1,15 +1,7 @@
--- ============================================================
--- AuthX DB Schema (v1 - VULNERABILA)
--- Proiect: Break the Login
--- ============================================================
-
--- Curata daca exista deja (pentru re-creare usoara)
 DROP TABLE IF EXISTS audit_logs CASCADE;
 DROP TABLE IF EXISTS tickets CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
 
--- 1. Tabelul users
--- VULN: password_hash stocheaza parola in CLAR (v1)
 CREATE TABLE users (
     id          SERIAL PRIMARY KEY,
     email       VARCHAR(255) UNIQUE NOT NULL,
@@ -19,8 +11,6 @@ CREATE TABLE users (
     locked      BOOLEAN DEFAULT FALSE
 );
 
--- 2. Tabelul tickets
--- owner_id este cheia pentru prevenirea IDOR (ignorat in v1)
 CREATE TABLE tickets (
     id          SERIAL PRIMARY KEY,
     title       VARCHAR(255) NOT NULL,
@@ -32,7 +22,6 @@ CREATE TABLE tickets (
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- 3. Tabelul audit_logs
 CREATE TABLE audit_logs (
     id          SERIAL PRIMARY KEY,
     user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -43,7 +32,6 @@ CREATE TABLE audit_logs (
     timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Date initiale de test
 INSERT INTO users (email, password_hash, role) VALUES
     ('admin@authx.com',   '123',           'MANAGER'),
     ('analyst@authx.com', 'parola123',     'ANALYST'),
